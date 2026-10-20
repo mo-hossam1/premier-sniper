@@ -2,7 +2,7 @@ name: Premiere IMAX Ticket Sniper
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/10 * * * *'
   workflow_dispatch:
     inputs:
       test_movie:
@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Playwright and Requests
+      - name: Install Dependencies
         run: |
           pip install playwright requests beautifulsoup4
           playwright install chromium --with-deps
@@ -27,16 +27,18 @@ jobs:
       - name: Check Live Cinema Feeds
         env:
           TARGET_MOVIE: ${{ github.event.inputs.test_movie || 'Dune' }}
-          NTFY_TOPIC: "zayed_imax_sniper_4821"
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC || 'zayed_imax_sniper_4821' }}
         run: |
           python - << 'EOF'
           import os
+          import re
           import requests
           from bs4 import BeautifulSoup
           from playwright.sync_api import sync_playwright
 
           movie = os.environ["TARGET_MOVIE"].strip()
           topic = os.environ["NTFY_TOPIC"].strip()
+          pattern = re.compile(re.escape(movie), re.IGNORECASE)
 
           elcinema_url = "https://elcinema.com/en/theater/3101134/"
           premiere_branch_url = "https://www.premiere-cinemas.com/en/cinemas/2"
@@ -56,35 +58,45 @@ jobs:
               )
               print(f"[ALERT SENT] Match found on {source}")
 
-          # 1. Check Elcinema IMAX Hall
-          res = requests.get(elcinema_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-          if res.status_code == 200:
-              soup = BeautifulSoup(res.text, "html.parser")
-              page_text = soup.get_text(" ", strip=True)
-              if movie.lower() in page_text.lower() and "egp" in page_text.lower():
-                  notify("Elcinema Premiere IMAX", elcinema_url)
-                  raise SystemExit(0)
+          # 1. Check Elcinema IMAX Hall (Per-Movie Block, Not Full Page)
+          try:
+              res = requests.get(elcinema_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+              if res.status_code == 200:
+                  soup = BeautifulSoup(res.text, "html.parser")
+                  # Each movie in a theater page sits inside its own row/container
+                  for row in soup.select(".row, .theater-movie, .boxed-category"):
+                      text = row.get_text(" ", strip=True)
+                      if pattern.search(text) and ("egp" in text.lower() or "pm" in text.lower() or "am" in text.lower()):
+                          notify("Elcinema Premiere IMAX", elcinema_url)
+                          raise SystemExit(0)
+          except Exception as e:
+              print(f"Elcinema check error: {e}")
 
           # 2. Check Premiere Cinemas Official Site
           with sync_playwright() as p:
               browser = p.chromium.launch(headless=True)
               page = browser.new_page()
 
-              page.goto(premiere_branch_url, wait_until="networkidle", timeout=30000)
-              page.wait_for_timeout(3000)
-              if movie.lower() in page.inner_text("body").lower():
-                  notify("Premiere Cinemas (Americana Plaza Page)", premiere_branch_url)
-                  browser.close()
-                  raise SystemExit(0)
-
-              page.goto(premiere_now_showing, wait_until="networkidle", timeout=30000)
-              page.wait_for_timeout(3000)
-              if movie.lower() in page.inner_text("body").lower():
-                  notify("Premiere Cinemas (Now Showing / Pre-book)", premiere_now_showing)
-                  browser.close()
-                  raise SystemExit(0)
+              for label, url in [
+                  ("Premiere Cinemas (Americana Plaza Page)", premiere_branch_url),
+                  ("Premiere Cinemas (Now Showing / Pre-book)", premiere_now_showing),
+              ]:
+                  try:
+                      page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                      page.wait_for_timeout(4000)
+                      body_text = page.inner_text("body")
+                      
+                      # Cut off any "Coming Soon" section at the bottom so we don't alert early
+                      active_section = re.split(r"coming\s+soon", body_text, flags=re.IGNORECASE)[0]
+                      
+                      if pattern.search(active_section):
+                          notify(label, url)
+                          browser.close()
+                          raise SystemExit(0)
+                  except Exception as e:
+                      print(f"Error checking {label}: {e}")
 
               browser.close()
 
-          print(f"Checked both sites. '{movie}' is not open for booking yet.")
+          print(f"Checked all feeds. '{movie}' is not open for booking yet.")
           EOF
