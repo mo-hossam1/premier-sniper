@@ -1,0 +1,90 @@
+name: Premiere IMAX Ticket Sniper
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_movie:
+        description: 'Movie name to test right now (e.g. Street Fighter or Dune)'
+        required: false
+        default: 'Dune'
+
+jobs:
+  scan-imax:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Playwright and Requests
+        run: |
+          pip install playwright requests beautifulsoup4
+          playwright install chromium --with-deps
+
+      - name: Check Live Cinema Feeds
+        env:
+          TARGET_MOVIE: ${{ github.event.inputs.test_movie || 'Dune' }}
+          NTFY_TOPIC: "zayed_imax_sniper_4821"
+        run: |
+          python - << 'EOF'
+          import os
+          import requests
+          from bs4 import BeautifulSoup
+          from playwright.sync_api import sync_playwright
+
+          movie = os.environ["TARGET_MOVIE"].strip()
+          topic = os.environ["NTFY_TOPIC"].strip()
+
+          elcinema_url = "https://elcinema.com/en/theater/3101134/"
+          premiere_branch_url = "https://www.premiere-cinemas.com/en/cinemas/2"
+          premiere_now_showing = "https://www.premiere-cinemas.com/now-showing"
+
+          def notify(source, url):
+              requests.post(
+                  f"https://ntfy.sh/{topic}",
+                  data=f"TICKETS LIVE: '{movie}' is open for booking on {source}!".encode("utf-8"),
+                  headers={
+                      "Title": f"IMAX DROP: {movie}",
+                      "Priority": "urgent",
+                      "Tags": "rotating_light,ticket",
+                      "Click": url
+                  },
+                  timeout=10
+              )
+              print(f"[ALERT SENT] Match found on {source}")
+
+          # 1. Check Elcinema IMAX Hall
+          res = requests.get(elcinema_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+          if res.status_code == 200:
+              soup = BeautifulSoup(res.text, "html.parser")
+              page_text = soup.get_text(" ", strip=True)
+              if movie.lower() in page_text.lower() and "egp" in page_text.lower():
+                  notify("Elcinema Premiere IMAX", elcinema_url)
+                  raise SystemExit(0)
+
+          # 2. Check Premiere Cinemas Official Site
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              page = browser.new_page()
+
+              page.goto(premiere_branch_url, wait_until="networkidle", timeout=30000)
+              page.wait_for_timeout(3000)
+              if movie.lower() in page.inner_text("body").lower():
+                  notify("Premiere Cinemas (Americana Plaza Page)", premiere_branch_url)
+                  browser.close()
+                  raise SystemExit(0)
+
+              page.goto(premiere_now_showing, wait_until="networkidle", timeout=30000)
+              page.wait_for_timeout(3000)
+              if movie.lower() in page.inner_text("body").lower():
+                  notify("Premiere Cinemas (Now Showing / Pre-book)", premiere_now_showing)
+                  browser.close()
+                  raise SystemExit(0)
+
+              browser.close()
+
+          print(f"Checked both sites. '{movie}' is not open for booking yet.")
+          EOF
